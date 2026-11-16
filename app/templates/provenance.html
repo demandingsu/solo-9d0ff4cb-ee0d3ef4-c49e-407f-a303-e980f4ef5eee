@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}报告 #{{ provenance.report_id }} 的来源{% endblock %}
+{% block content %}
+
+<section class="card">
+  <h2>报告 #{{ provenance.report_id }} 的原件与映射</h2>
+  <p class="meta"><a href="/">返回</a></p>
+
+  {% if not provenance.assay %}
+    <p class="empty">该报告使用的是直接上传的成品 CSV，没有由原件换算而来。</p>
+  {% else %}
+    <p class="hint">
+      以下版本是报告计算时实际使用的原件与映射。即使之后上传了新原件或修改了映射，
+      这些历史版本仍完整保留，可按当时的内容复核。
+    </p>
+
+    <div class="input-card">
+      <h3>原件 v{{ provenance.assay.version_id }}</h3>
+      <p class="meta">
+        {{ provenance.assay.filename or "未命名" }} · 保存于 {{ provenance.assay.created_at }}
+        · <a href="{{ provenance.assay.download_url }}">下载原件 CSV</a>
+        · <a href="/assay/versions/{{ provenance.assay.version_id }}">查看原件</a>
+      </p>
+    </div>
+
+    <div class="input-card">
+      <h3>换算后的成品 v{{ provenance.samples_version }}</h3>
+      <p class="meta">
+        <a href="/inputs/samples/versions/{{ provenance.samples_version }}/export.csv">下载当时的成品 CSV</a>
+      </p>
+    </div>
+
+    {% if provenance.mapping %}
+    <div class="input-card">
+      <h3>映射 v{{ provenance.mapping.version_id }}</h3>
+      <p class="meta">
+        建立于 {{ provenance.mapping.created_at }}
+        · <a href="/mappings/{{ provenance.mapping.version_id }}">查看映射</a>
+      </p>
+      <table class="mini-table">
+        <thead><tr><th>原件列</th><th>基准元素</th><th>原单位</th><th>换算</th></tr></thead>
+        <tbody>
+          {% for entry in provenance.mapping.entries %}
+          <tr>
+            <th>{{ entry.label }}</th>
+            <td>{{ entry.element }}</td>
+            <td>{{ entry.unit }}</td>
+            <td>{% if entry.unit == "%" %}按原值使用{% else %}÷ 10000 转为 %{% endif %}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+      <p class="notice notice-warn">该报告记录的原件没有关联映射版本。</p>
+    {% endif %}
+  {% endif %}
+</section>
+
+{% endblock %}

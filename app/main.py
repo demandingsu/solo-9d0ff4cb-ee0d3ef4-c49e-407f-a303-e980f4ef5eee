@@ -21,12 +21,23 @@ from starlette.concurrency import run_in_threadpool
 
 from . import formatting
 from .compute import ComputeError, compute_report
-from .db import ReportRecord, Store, StoreError, VersionedInput
+from .db import (
+    ReportRecord,
+    Store,
+    StoreError,
+    VersionedInput,
+)
 from .inputs import (
     MAX_UPLOAD_BYTES,
+    AssayConversionError,
+    AssayInput,
+    AssayMapping,
     BaselineInput,
     InputValidationError,
     SamplesInput,
+    build_mapping,
+    convert_assay,
+    parse_assay,
     parse_baseline,
     parse_samples,
 )
@@ -72,6 +83,66 @@ def create_app(database_path: str | None = None) -> FastAPI:
             SamplesInput.from_payload(snapshot.samples.payload),
         )
 
+    def conversion_context() -> dict[str, Any]:
+        """Everything the mapping form needs to render."""
+
+        snapshot = store.conversion_snapshot()
+        baseline = (
+            BaselineInput.from_payload(snapshot.baseline.payload)
+            if snapshot.baseline is not None
+            else None
+        )
+        assay = (
+            AssayInput.from_payload(snapshot.assay.assay.payload)
+            if snapshot.assay is not None
+            else None
+        )
+        mapping = (
+            AssayMapping.from_payload(snapshot.assay.mapping.payload)
+            if snapshot.assay is not None and snapshot.assay.mapping is not None
+            else None
+        )
+        mapping_slots: list[dict[str, str] | None] = [None] * (
+            len(assay.columns) if assay is not None else 0
+        )
+        if mapping is not None:
+            for entry in mapping.entries:
+                if 0 <= entry.column < len(mapping_slots):
+                    mapping_slots[entry.column] = {
+                        "element": entry.element,
+                        "unit": entry.unit,
+                        "label": entry.label,
+                    }
+        return {
+            "baseline": baseline,
+            "assay": assay,
+            "assay_version": (
+                snapshot.assay.assay.version_id if snapshot.assay else None
+            ),
+            "assay_filename": (
+                snapshot.assay.assay.filename if snapshot.assay else None
+            ),
+            "assay_created_at": (
+                snapshot.assay.assay.created_at if snapshot.assay else None
+            ),
+            "mapping": mapping,
+            "mapping_slots": mapping_slots,
+            "mapping_version": (
+                snapshot.assay.mapping.version_id
+                if snapshot.assay and snapshot.assay.mapping
+                else None
+            ),
+            "mapping_created_at": (
+                snapshot.assay.mapping.created_at
+                if snapshot.assay and snapshot.assay.mapping
+                else None
+            ),
+            "raw_preview": (
+                _assay_preview(assay, limit=10) if assay is not None else []
+            ),
+            "rows_total": len(assay.rows) if assay is not None else 0,
+        }
+
     def input_summary(value: VersionedInput | None) -> dict[str, Any] | None:
         if value is None:
             return None
@@ -110,6 +181,8 @@ def create_app(database_path: str | None = None) -> FastAPI:
             "created_at": record.created_at,
             "baseline_version": record.baseline_version,
             "samples_version": record.samples_version,
+            "assay_version": record.assay_version,
+            "mapping_version": record.mapping_version,
             "stale": record.is_stale,
             "baseline_current": record.baseline_is_current,
             "samples_current": record.samples_is_current,
@@ -121,12 +194,44 @@ def create_app(database_path: str | None = None) -> FastAPI:
     def context(request: Request) -> dict[str, Any]:
         current = store.current_inputs()
         record = store.latest_report()
+        conversion = conversion_context()
+        samples_current = current["samples"]
+        conversion["samples_match_assay"] = bool(
+            samples_current is not None
+            and conversion["assay_version"] is not None
+            and samples_current.assay_version == conversion["assay_version"]
+            and samples_current.mapping_version
+            == conversion["mapping_version"]
+        )
+        summaries = store.recent_reports()
         return {
             "request": request,
             "current": {
                 kind: input_summary(value) for kind, value in current.items()
             },
+            "current_samples_source": (
+                {
+                    "assay_version": samples_current.assay_version,
+                    "mapping_version": samples_current.mapping_version,
+                }
+                if samples_current is not None
+                else None
+            ),
             "report": report_view(record),
+            "report_history": [
+                {
+                    "id": summary.report_id,
+                    "created_at": summary.created_at,
+                    "samples_version": summary.samples_version,
+                    "assay_version": summary.assay_version,
+                    "mapping_version": summary.mapping_version,
+                    "sample_count": summary.sample_count,
+                    "non_unique_count": summary.non_unique_count,
+                    "stale": summary.is_stale,
+                }
+                for summary in summaries
+            ],
+            "conversion": conversion,
             "notice": request.query_params.get("notice"),
             "notice_kind": request.query_params.get("notice_kind", "ok"),
             "max_upload_mb": MAX_UPLOAD_BYTES // (1024 * 1024),
@@ -206,12 +311,262 @@ def create_app(database_path: str | None = None) -> FastAPI:
             "report",
         )
 
-    def _render_with_error(request: Request, message: str) -> HTMLResponse:
+    def _render_with_error(
+        request: Request, message: str, *, status_code: int = 400
+    ) -> HTMLResponse:
         ctx = context(request)
         ctx["notice"] = message
         ctx["notice_kind"] = "error"
         return templates.TemplateResponse(
+            request, "index.html", ctx, status_code=status_code
+        )
+
+    # -- original assay sheet --------------------------------------------
+
+    @app.post("/assay/upload")
+    async def upload_assay(
+        request: Request, assay_file: UploadFile | None = File(None)
+    ) -> Response:
+        if assay_file is None or not assay_file.filename:
+            return redirect_notice("请选择一个原件 CSV 再上传。", "error", "assay")
+        raw = await assay_file.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_UPLOAD_BYTES:
+            return _render_with_error(
+                request,
+                f"原件文件超过 {MAX_UPLOAD_BYTES // (1024 * 1024)} MB 上限",
+            )
+        try:
+            assay = await run_in_threadpool(parse_assay, raw)
+        except InputValidationError as exc:
+            return _render_with_error(request, f"原件文件：{exc}")
+        filename = (
+            assay_file.filename.replace("\\", "/").rsplit("/", 1)[-1][:200]
+            or "未命名.csv"
+        )
+        try:
+            version = await run_in_threadpool(
+                store.save_assay, assay.to_payload(), filename
+            )
+        except StoreError as exc:
+            return _render_with_error(
+                request, f"原件保存失败，原有原件仍有效：{exc}"
+            )
+        return redirect_notice(
+            f"原件 v{version} 已保存（{len(assay.rows)} 行）。"
+            "请逐列指定基准元素与单位后换算。",
+            "ok",
+            "assay",
+        )
+
+    def _mapping_choices(
+        form: list[tuple[str, str]]
+    ) -> tuple[list[str], list[str]]:
+        """Read the four ``element_*`` / ``unit_*`` pairs in column order."""
+
+        values = dict(form)
+        elements = [values.get(f"element_{i}", "") for i in range(4)]
+        units = [values.get(f"unit_{i}", "") for i in range(4)]
+        return elements, units
+
+    async def _read_form(request: Request) -> list[tuple[str, str]]:
+        form = await request.form()
+        return [(str(key), str(value)) for key, value in form.multi_items()]
+
+    def _form_versions(
+        form: list[tuple[str, str]]
+    ) -> tuple[int | None, int | None, int | None]:
+        values = dict(form)
+
+        def optional(name: str) -> int | None:
+            raw = values.get(name, "")
+            return int(raw) if raw.strip().isdigit() else None
+
+        return (
+            optional("baseline_version"),
+            optional("assay_version"),
+            optional("mapping_version"),
+        )
+
+    def _render_stale_form(
+        request: Request,
+        message: str,
+    ) -> HTMLResponse:
+        return _conversion_failure(
+            request,
+            message + "请刷新页面，确认当前基准、原件与映射后重新提交。",
+        )
+
+    def _form_matches_current(
+        request: Request,
+        form: list[tuple[str, str]],
+        snapshot,
+    ) -> HTMLResponse | None:
+        """Reject a form rendered against a different set of versions.
+
+        The four element columns are matched positionally, so a new original
+        sheet with a different column order would silently receive the old
+        choices.  Hidden version fields bind the form to what the user saw.
+        """
+
+        baseline_version, assay_version, mapping_version = _form_versions(form)
+        current_mapping = snapshot.assay.mapping if snapshot.assay else None
+        current_mapping_version = (
+            current_mapping.version_id if current_mapping is not None else None
+        )
+        if (
+            baseline_version is not None
+            and snapshot.baseline is not None
+            and baseline_version != snapshot.baseline.version_id
+        ):
+            return _render_stale_form(request, "当前基准已改变，本次提交未执行。")
+        if (
+            assay_version is not None
+            and (snapshot.assay is None or assay_version != snapshot.assay.assay.version_id)
+        ):
+            return _render_stale_form(request, "当前原件已改变，本次提交未执行。")
+        if (
+            mapping_version is not None
+            and mapping_version != current_mapping_version
+        ):
+            return _render_stale_form(request, "映射已改变，本次提交未执行。")
+        return None
+
+    def _conversion_failure(
+        request: Request,
+        message: str,
+        *,
+        errors: list[str] | None = None,
+        error_heading: str | None = None,
+    ) -> HTMLResponse:
+        ctx = context(request)
+        ctx["notice"] = message
+        ctx["notice_kind"] = "error"
+        ctx["conversion_errors"] = errors or []
+        ctx["conversion_error_heading"] = error_heading
+        return templates.TemplateResponse(
             request, "index.html", ctx, status_code=400
+        )
+
+    @app.post("/assay/mapping")
+    async def save_mapping(request: Request) -> Response:
+        """Store a new mapping version without converting.
+
+        Used when the mapping must be edited first; conversion is a separate
+        step so a failed conversion cannot leave a mapping half-applied.
+        """
+
+        form = await _read_form(request)
+        snapshot = await run_in_threadpool(store.conversion_snapshot)
+        if snapshot.baseline is None:
+            return _conversion_failure(
+                request, "必须先有当前基准，才能建立元素映射。"
+            )
+        if snapshot.assay is None:
+            return _conversion_failure(request, "请先上传原件 CSV。")
+        stale = _form_matches_current(request, form, snapshot)
+        if stale is not None:
+            return stale
+        baseline = BaselineInput.from_payload(snapshot.baseline.payload)
+        assay = AssayInput.from_payload(snapshot.assay.assay.payload)
+        elements, units = _mapping_choices(form)
+        try:
+            mapping = build_mapping(assay, baseline, elements, units)
+        except InputValidationError as exc:
+            return _conversion_failure(request, str(exc))
+        try:
+            mapping_version = await run_in_threadpool(
+                store.save_mapping,
+                snapshot.assay.assay.version_id,
+                mapping.to_payload(),
+            )
+        except StoreError as exc:
+            return _conversion_failure(request, f"映射保存失败：{exc}")
+        if mapping_version is None:
+            return _conversion_failure(
+                request,
+                "保存映射期间已有新原件上传，该映射未保存；请刷新后针对当前原件重试。",
+            )
+        return redirect_notice(
+            f"映射 v{mapping_version} 已保存，尚未换算。"
+            "点击“按此映射换算”生成成品。",
+            "ok",
+            "assay",
+        )
+
+    @app.post("/assay/convert")
+    async def convert(request: Request) -> Response:
+        form = await _read_form(request)
+        snapshot = await run_in_threadpool(store.conversion_snapshot)
+        if snapshot.baseline is None:
+            return _conversion_failure(
+                request, "当前没有基准 CSV，无法换算原件。"
+            )
+        if snapshot.assay is None:
+            return _conversion_failure(request, "请先上传原件 CSV。")
+        stale = _form_matches_current(request, form, snapshot)
+        if stale is not None:
+            return stale
+        baseline = BaselineInput.from_payload(snapshot.baseline.payload)
+        assay = AssayInput.from_payload(snapshot.assay.assay.payload)
+        elements, units = _mapping_choices(form)
+        try:
+            mapping = build_mapping(assay, baseline, elements, units)
+        except InputValidationError as exc:
+            return _conversion_failure(request, str(exc))
+
+        baseline_version = snapshot.baseline.version_id
+        assay_version = snapshot.assay.assay.version_id
+        current_mapping = snapshot.assay.mapping
+        current_mapping_id = (
+            current_mapping.version_id if current_mapping is not None else None
+        )
+
+        try:
+            samples = await run_in_threadpool(
+                convert_assay, assay, mapping, baseline
+            )
+        except AssayConversionError as exc:
+            heading = (
+                f"原件换算失败：发现 {exc.total} 处问题，整批拒收，"
+                "现役成品与旧报告均未改动。"
+            )
+            if exc.total > len(exc.errors):
+                heading += f"以下仅列出前 {len(exc.errors)} 处："
+            else:
+                heading += "问题如下："
+            return _conversion_failure(
+                request,
+                heading,
+                errors=exc.errors,
+                error_heading=heading,
+            )
+
+        try:
+            result = await run_in_threadpool(
+                store.publish_conversion,
+                baseline_version=baseline_version,
+                assay_version=assay_version,
+                mapping_version=current_mapping_id,
+                mapping_payload=mapping.to_payload(),
+                samples_payload=samples.to_payload(),
+                filename=snapshot.assay.assay.filename,
+            )
+        except StoreError as exc:
+            return _conversion_failure(
+                request, f"换算结果写入失败，现役成品未替换：{exc}"
+            )
+        if result is None:
+            return _conversion_failure(
+                request,
+                "换算期间基准、原件或映射已改变，本次结果未发布；"
+                "现役成品与已有报告均未改动。请刷新后重试。",
+            )
+        return redirect_notice(
+            f"换算成功：成品 v{result.samples_version}（映射 "
+            f"v{result.mapping_version}，{len(samples.sample_ids)} 个样本）"
+            "已整版替换现役成品，旧报告随之过期。",
+            "ok",
+            "report",
         )
 
     @app.post("/compute")
@@ -350,18 +705,128 @@ def create_app(database_path: str | None = None) -> FastAPI:
         current = store.current_inputs().get(kind)
         if current is None:
             return PlainTextResponse("输入尚未上传", status_code=404)
+        return _input_csv_response(kind, current.payload, "current")
+
+    # -- original / mapping retrieval ------------------------------------
+
+    @app.get("/assay/versions/{version_id}/download.csv")
+    def download_assay(version_id: int) -> Response:
+        assay = store.get_assay(version_id)
+        if assay is None:
+            return PlainTextResponse("原件版本不存在", status_code=404)
+        raw = bytes(AssayInput.from_payload(assay.payload).raw_bytes)
+        return Response(
+            raw,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="assay-v{version_id}.csv"'
+                )
+            },
+        )
+
+    @app.get("/assay/versions/{version_id}")
+    def assay_version_page(request: Request, version_id: int) -> Response:
+        assay = store.get_assay(version_id)
+        if assay is None:
+            return PlainTextResponse("原件版本不存在", status_code=404)
+        parsed = AssayInput.from_payload(assay.payload)
+        ctx = context(request)
+        ctx["version_detail"] = {
+            "kind": "原件",
+            "version_id": assay.version_id,
+            "filename": assay.filename,
+            "created_at": assay.created_at,
+            "columns": list(parsed.columns),
+            "rows": [
+                [str(row.line_no), row.sample_id, *row.values]
+                for row in parsed.rows[:200]
+            ],
+            "total": len(parsed.rows),
+            "download_url": f"/assay/versions/{version_id}/download.csv",
+        }
+        return templates.TemplateResponse(request, "version.html", ctx)
+
+    @app.get("/mappings/{version_id}")
+    def mapping_version_page(request: Request, version_id: int) -> Response:
+        mapping = store.get_mapping(version_id)
+        if mapping is None:
+            return PlainTextResponse("映射版本不存在", status_code=404)
+        parsed = AssayMapping.from_payload(mapping.payload)
+        ctx = context(request)
+        ctx["version_detail"] = {
+            "kind": "映射",
+            "version_id": mapping.version_id,
+            "filename": mapping.filename,
+            "created_at": mapping.created_at,
+            "assay_version": mapping.assay_version,
+            "entries": [
+                {
+                    "label": entry.label,
+                    "element": entry.element,
+                    "unit": entry.unit,
+                }
+                for entry in parsed.entries
+            ],
+            "total": None,
+            "download_url": f"/assay/versions/{mapping.assay_version}/download.csv",
+        }
+        return templates.TemplateResponse(request, "version.html", ctx)
+
+    @app.get("/reports/{report_id}/provenance")
+    def report_provenance_page(request: Request, report_id: int) -> Response:
+        record = store.get_report(report_id)
+        if record is None:
+            return PlainTextResponse("报告不存在", status_code=404)
+        provenance = store.report_provenance(report_id)
+        ctx = context(request)
+        ctx["provenance"] = {
+            "report_id": report_id,
+            "assay_version": record.assay_version,
+            "mapping_version": record.mapping_version,
+            "samples_version": record.samples_version,
+            "assay": (
+                {
+                    "version_id": provenance.assay.version_id,
+                    "filename": provenance.assay.filename,
+                    "created_at": provenance.assay.created_at,
+                    "download_url": (
+                        f"/assay/versions/{provenance.assay.version_id}"
+                        "/download.csv"
+                    ),
+                }
+                if provenance and provenance.assay
+                else None
+            ),
+            "mapping": (
+                {
+                    "version_id": provenance.mapping.version_id,
+                    "created_at": provenance.mapping.created_at,
+                    "entries": AssayMapping.from_payload(
+                        provenance.mapping.payload
+                    ).entries,
+                }
+                if provenance and provenance.mapping
+                else None
+            ),
+        }
+        return templates.TemplateResponse(request, "provenance.html", ctx)
+
+    def _input_csv_response(
+        kind: str, payload: dict[str, Any], suffix: str
+    ) -> Response:
         if kind == "baseline":
-            value = BaselineInput.from_payload(current.payload)
+            value = BaselineInput.from_payload(payload)
             header = ["ore", *value.elements]
             rows = [
-                [ore, *[formatting.decimal(x, 12) for x in row]]
+                [ore, *[formatting.exact_decimal(x) for x in row]]
                 for ore, row in zip(value.ores, value.rows)
             ]
         else:
-            value = SamplesInput.from_payload(current.payload)
+            value = SamplesInput.from_payload(payload)
             header = ["sample_id", *value.elements]
             rows = [
-                [sample_id, *[formatting.decimal(x, 12) for x in row]]
+                [sample_id, *[formatting.exact_decimal(x) for x in row]]
                 for sample_id, row in zip(value.sample_ids, value.rows)
             ]
         lines = [",".join(_csv_cell(cell) for cell in header)]
@@ -370,9 +835,20 @@ def create_app(database_path: str | None = None) -> FastAPI:
             "﻿" + "\r\n".join(lines) + "\r\n",
             media_type="text/csv; charset=utf-8",
             headers={
-                "Content-Disposition": f'attachment; filename="{kind}.csv"'
+                "Content-Disposition": (
+                    f'attachment; filename="{kind}-{suffix}.csv"'
+                )
             },
         )
+
+    @app.get("/inputs/samples/versions/{version_id}/export.csv")
+    def export_samples_version(version_id: int) -> Response:
+        """A converted samples version, kept after it stops being current."""
+
+        payload = store.get_input_payload(version_id, "samples")
+        if payload is None:
+            return PlainTextResponse("成品版本不存在", status_code=404)
+        return _input_csv_response("samples", payload, f"v{version_id}")
 
     @app.get("/api/latest")
     def api_latest() -> JSONResponse:
@@ -403,6 +879,8 @@ def create_app(database_path: str | None = None) -> FastAPI:
                     "created_at": record.created_at,
                     "baseline_version": record.baseline_version,
                     "samples_version": record.samples_version,
+                    "assay_version": record.assay_version,
+                    "mapping_version": record.mapping_version,
                     "stale": record.is_stale,
                     "payload": record.payload,
                 }
@@ -417,6 +895,13 @@ def _csv_cell(value: Any) -> str:
     if any(ch in text for ch in [",", '"', "\r", "\n"]):
         return '"' + text.replace('"', '""') + '"'
     return text
+
+
+def _assay_preview(assay: AssayInput, limit: int) -> list[list[str]]:
+    return [
+        [str(row.line_no), row.sample_id, *row.values]
+        for row in assay.rows[:limit]
+    ]
 
 
 class _LabeledError(Exception):

@@ -54,6 +54,41 @@ def decimal(value: Fraction | str, places: int = DISPLAY_PLACES) -> str:
     return text
 
 
+def exact_decimal(value: Fraction | str) -> str:
+    """Render a terminating rational as an exact decimal, no rounding.
+
+    Used by CSV exports of input data: everything there originates from a
+    finite decimal (divided by a power of ten for ppm), so a lossless text
+    form always exists and re-importing the export reproduces it exactly.
+    Non-terminating values fall back to the rounded display form.
+    """
+
+    rational = frac(value)
+    if rational == 0:
+        return "0"
+    numerator, denominator = rational.numerator, rational.denominator
+    twos = fives = 0
+    while denominator % 2 == 0:
+        denominator //= 2
+        twos += 1
+    while denominator % 5 == 0:
+        denominator //= 5
+        fives += 1
+    if denominator != 1:
+        return decimal(rational, 12)
+    places = max(twos, fives)
+    scaled = numerator * (10**places) // rational.denominator
+    sign = "-" if scaled < 0 else ""
+    digits = str(abs(scaled)).rjust(places + 1, "0")
+    if places == 0:
+        return sign + digits
+    whole, fraction_part = digits[:-places], digits[-places:]
+    fraction_part = fraction_part.rstrip("0")
+    if not fraction_part:
+        return sign + whole
+    return f"{sign}{whole}.{fraction_part}"
+
+
 def percent(value: Fraction | str, places: int = 4) -> str:
     return decimal(frac(value) * 100, places)
 

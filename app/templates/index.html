@@ -1,6 +1,16 @@
 {% extends "base.html" %}
 {% block content %}
 
+{% if conversion_errors %}
+<div class="notice notice-error" role="alert">
+  <p><b>{{ conversion_error_heading or "原件换算未执行，整批拒收。" }}</b></p>
+  <p class="hint">行号为原件 CSV 中的物理行号（含空行与带引号的换行）。</p>
+  <ul class="error-list">
+    {% for error in conversion_errors %}<li>{{ error }}</li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+
 <section class="card" id="upload">
   <h2>1. 上传输入（整版替换）</h2>
   <p class="hint">
@@ -56,11 +66,148 @@
           <a href="/inputs/samples/export.csv">导出</a></p>
         <p class="meta">共 {{ s.count }} 个样本，元素列：{{ s.elements|join("、") }}</p>
         <p class="meta">前几个编号：{{ s.names|join("、") }}{% if s.count > s.names|length %} …{% endif %}</p>
+        {% if current_samples_source and current_samples_source.assay_version %}
+        <p class="meta">
+          来源：<a href="/assay/versions/{{ current_samples_source.assay_version }}">原件 v{{ current_samples_source.assay_version }}</a>
+          · <a href="/mappings/{{ current_samples_source.mapping_version }}">映射 v{{ current_samples_source.mapping_version }}</a>
+          · <a href="/inputs/samples/versions/{{ s.version }}/export.csv">下载此版本 CSV</a>
+        </p>
+        {% else %}
+        <p class="meta">来源：直接上传的成品 CSV</p>
+        {% endif %}
       {% else %}
         <p class="empty">尚未上传成品 CSV。</p>
       {% endif %}
     </div>
   </div>
+</section>
+
+<section class="card" id="assay">
+  <h2>1b. 原件化验单换算为成品</h2>
+  <p class="hint">
+    仪器成品化验单的列名与单位可能和基准不同。上传<b>原件 CSV</b>（样本编号 + 四项元素）
+    后，逐列指定它对应的当前基准元素与原单位（% 或 ppm）。映射必须一一对应：四个基准元素
+    各用一次。换算按十进制精确进行（1 ppm = 1/10000 %）。
+  </p>
+
+  <form method="post" action="/assay/upload" enctype="multipart/form-data" class="upload-form">
+    <div class="upload-grid">
+      <label class="upload-box">
+        <span class="upload-title">原件 CSV（仪器原始化验单）</span>
+        <span class="upload-example">sample_no,Fe_pct,Si,Al,Ca<br>S-1001,62.74,37100,20200,11300</span>
+        <input type="file" name="assay_file" accept=".csv,text/csv">
+      </label>
+    </div>
+    <div class="actions">
+      <button type="submit" class="primary">上传原件</button>
+      <span class="hint">上传原件不会替换现役成品；需完成换算并成功后才整版替换。</span>
+    </div>
+  </form>
+
+  {% set c = conversion %}
+  {% if c.assay %}
+  <div class="input-card assay-card">
+    <p class="meta">
+      当前原件 v{{ c.assay_version }} · {{ c.assay_filename or "未命名" }} · {{ c.assay_created_at }}
+      · 共 {{ c.rows_total }} 个样本
+      · <a href="/assay/versions/{{ c.assay_version }}">查看原件</a>
+      · <a href="/assay/versions/{{ c.assay_version }}/download.csv">下载原件</a>
+      {% if c.mapping %}
+      · 映射 <a href="/mappings/{{ c.mapping_version }}">v{{ c.mapping_version }}</a>（{{ c.mapping_created_at }}）
+      {% else %}
+      · <b>尚未建立映射</b>
+      {% endif %}
+      {% if c.samples_match_assay %}
+      · <span class="badge badge-fresh">现役成品已由该原件换算</span>
+      {% endif %}
+    </p>
+
+    {% if not c.baseline %}
+      <p class="notice notice-warn">当前没有基准 CSV，无法建立映射；请先上传基准。</p>
+    {% endif %}
+
+    <div class="table-scroll">
+      <table class="report-table assay-table">
+        <thead>
+          <tr>
+            <th>原件行号</th><th>样本编号</th>
+            {% for label in c.assay.columns %}<th>{{ label }}</th>{% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in c.raw_preview %}
+          <tr>
+            <td class="num-cell">{{ row[0] }}</td>
+            <td class="sample-id">{{ row[1] }}</td>
+            {% for v in row[2:] %}<td class="num-cell">{{ v }}</td>{% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if c.rows_total > c.raw_preview|length %}
+      <p class="hint">仅预览前 {{ c.raw_preview|length }} 行，
+        其余 {{ c.rows_total - c.raw_preview|length }} 行请查看/下载原件。</p>
+    {% endif %}
+
+    {% if c.baseline %}
+    <form method="post" action="/assay/convert" class="mapping-form">
+      <input type="hidden" name="baseline_version" value="{{ current.baseline.version if current.baseline else '' }}">
+      <input type="hidden" name="assay_version" value="{{ c.assay_version }}">
+      <input type="hidden" name="mapping_version" value="{{ c.mapping_version or '' }}">
+      <table class="mini-table mapping-table">
+        <thead>
+          <tr><th>原件列</th><th>对应基准元素</th><th>原单位</th><th>换算后</th></tr>
+        </thead>
+        <tbody>
+          {% for label in c.assay.columns %}
+          {% set i = loop.index0 %}
+          {% set mapped = c.mapping_slots[i] %}
+          <tr>
+            <th>{{ label }}</th>
+            <td>
+              <select name="element_{{ i }}">
+                <option value="">— 请选择 —</option>
+                {% for e in c.baseline.elements %}
+                <option value="{{ e }}" {% if mapped and mapped.element == e %}selected{% endif %}>{{ e }}</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td>
+              <select name="unit_{{ i }}">
+                <option value="">— 请选择 —</option>
+                {% for u in ["%", "ppm"] %}
+                <option value="{{ u }}" {% if mapped and mapped.unit == u %}selected{% endif %}>{{ u }}</option>
+                {% endfor %}
+              </select>
+            </td>
+            <td class="meta">
+              {% if mapped %}
+                {% if mapped.unit == "%" %}按原值使用{% else %}÷ 10000 转为 %{% endif %}
+              {% else %}—{% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <div class="actions">
+        <button type="submit" class="primary">按此映射换算并替换成品</button>
+        <button type="submit" formaction="/assay/mapping" class="secondary">仅保存映射</button>
+        <span class="hint">
+          修改映射后再次换算，即从同一原件重算并整版替换成品；“仅保存映射”只登记映射、
+          不改动现役成品。映射未变化时重复换算不会产生新的映射版本。
+        </span>
+      </div>
+      <p class="hint">
+        任一格含检出限标记（如 &lt;0.01 / ND）、样本编号重复或数值非法时，
+        整批拒收并在上方列出原件行号；现役成品与旧报告保持不变。
+      </p>
+    </form>
+    {% endif %}
+  </div>
+  {% else %}
+  <p class="empty">尚未上传原件 CSV。若成品化验单的列名/单位与基准一致，也可直接上传成品 CSV。</p>
+  {% endif %}
 </section>
 
 <section class="card" id="compute">
@@ -90,6 +237,12 @@
         <span class="report-id">报告 #{{ report.id }}</span>
         <span class="meta">生成于 {{ report.created_at }} · 基准 v{{ report.baseline_version }} ·
           成品 v{{ report.samples_version }}</span>
+        {% if report.assay_version %}
+        <span class="meta">· 原件 v{{ report.assay_version }} · 映射 v{{ report.mapping_version }}</span>
+        {% endif %}
+        {% if report.stale %}
+        <span class="meta">· <a href="/reports/{{ report.id }}/provenance">查看原件与映射版本</a></span>
+        {% endif %}
       </div>
       {% if report.stale %}
         <span class="badge badge-stale">已过期</span>
@@ -186,5 +339,49 @@
     </p>
   {% endif %}
 </section>
+
+{% if report_history %}
+<section class="card" id="history">
+  <h2>4. 历史报告</h2>
+  <p class="hint">
+    使用换算数据生成的报告会记录当时的原件与映射版本；即使之后上传了新原件或修改了映射，
+    历史报告仍可查到并下载当时的文件。
+  </p>
+  <div class="table-scroll">
+    <table class="report-table history-table">
+      <thead>
+        <tr>
+          <th>报告</th><th>生成时间</th><th>状态</th><th>样本数</th>
+          <th>无法唯一确定</th><th>成品版本</th><th>原件 / 映射</th><th>来源</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in report_history %}
+        <tr>
+          <td><a href="/reports/{{ item.id }}/export.csv">#{{ item.id }}</a></td>
+          <td class="meta">{{ item.created_at }}</td>
+          <td>
+            {% if item.stale %}
+              <span class="badge badge-stale">已过期</span>
+            {% else %}
+              <span class="badge badge-fresh">一致</span>
+            {% endif %}
+          </td>
+          <td class="num-cell">{{ item.sample_count }}</td>
+          <td class="num-cell">{{ item.non_unique_count }}</td>
+          <td class="num-cell">v{{ item.samples_version }}</td>
+          <td class="meta">
+            {% if item.assay_version %}
+              原件 v{{ item.assay_version }} · 映射 v{{ item.mapping_version }}
+            {% else %}—{% endif %}
+          </td>
+          <td><a href="/reports/{{ item.id }}/provenance">查看原件与映射</a></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
 
 {% endblock %}

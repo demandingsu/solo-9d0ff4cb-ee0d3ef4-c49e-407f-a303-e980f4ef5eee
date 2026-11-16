@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}{{ version_detail.kind }} v{{ version_detail.version_id }}{% endblock %}
+{% block content %}
+
+<section class="card">
+  <h2>{{ version_detail.kind }} v{{ version_detail.version_id }}</h2>
+  <p class="meta">
+    {% if version_detail.filename %}{{ version_detail.filename }} · {% endif %}
+    保存于 {{ version_detail.created_at }}
+    · <a href="{{ version_detail.download_url }}">下载原件 CSV</a>
+    · <a href="/">返回</a>
+  </p>
+
+  {% if version_detail.kind == "原件" %}
+    <p class="hint">这是入库时保存的原件，内容与上传文件逐字节一致。下表行号为原件 CSV 的物理行号。</p>
+    <div class="table-scroll">
+      <table class="report-table">
+        <thead>
+          <tr><th>行号</th><th>样本编号</th>{% for label in version_detail.columns %}<th>{{ label }}</th>{% endfor %}</tr>
+        </thead>
+        <tbody>
+          {% for row in version_detail.rows %}
+          <tr>
+            <td class="num-cell">{{ row[0] }}</td>
+            <td class="sample-id">{{ row[1] }}</td>
+            {% for v in row[2:] %}<td class="num-cell">{{ v }}</td>{% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if version_detail.total > version_detail.rows|length %}
+      <p class="hint">仅显示前 {{ version_detail.rows|length }} 行，共 {{ version_detail.total }} 行；完整内容请下载原件。</p>
+    {% endif %}
+  {% else %}
+    <p class="hint">该映射适用于原件 v{{ version_detail.assay_version }}。</p>
+    <table class="mini-table">
+      <thead><tr><th>原件列</th><th>基准元素</th><th>原单位</th><th>换算</th></tr></thead>
+      <tbody>
+        {% for entry in version_detail.entries %}
+        <tr>
+          <th>{{ entry.label }}</th>
+          <td>{{ entry.element }}</td>
+          <td>{{ entry.unit }}</td>
+          <td>{% if entry.unit == "%" %}按原值使用{% else %}÷ 10000 转为 %{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+</section>
+
+{% endblock %}

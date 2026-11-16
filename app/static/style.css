@@ -120,6 +120,38 @@ button.primary {
 }
 button.primary:hover:not(:disabled) { background: var(--accent-strong); }
 button.primary:disabled { background: #a8bcc5; cursor: not-allowed; }
+button.secondary {
+  background: #fff;
+  color: var(--accent-strong);
+  border: 1px solid var(--accent);
+  border-radius: 7px;
+  padding: 9px 18px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+button.secondary:hover { background: #eef7fa; }
+
+.assay-card { margin-top: 18px; }
+.assay-card .meta { margin: 4px 0 10px; }
+.assay-table { margin-bottom: 8px; }
+.mapping-form { margin-top: 16px; }
+.mapping-table { max-width: 720px; }
+.mapping-table td { text-align: left; }
+.mapping-table select {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  font-size: 13.5px;
+  min-width: 110px;
+}
+.error-list {
+  margin: 8px 0 0;
+  padding-left: 22px;
+  font-size: 13.5px;
+}
+.error-list li { margin: 2px 0; }
 
 .current-inputs {
   display: grid;
