@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}矿石配料反推{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="wrap">
+      <h1>矿石配料反推与异常定位</h1>
+      <p class="subtitle">由成品四项元素含量反推三种原矿的质量占比</p>
+    </div>
+  </header>
+
+  <main class="wrap">
+    {% if notice %}
+    <div class="notice notice-{{ notice_kind }}" role="status">{{ notice }}</div>
+    {% endif %}
+
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="wrap footer">
+    <p>计算采用精确有理数运算；最优解不唯一时只报告可达范围，不选取任意一组。</p>
+  </footer>
+</body>
+</html>

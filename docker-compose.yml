@@ -1,0 +1,14 @@
+services:
+  web:
+    build: .
+    image: ore-blend-app:local
+    ports:
+      - "8000:8000"
+    environment:
+      ORE_DB_PATH: /app/data/app.db
+    volumes:
+      - ore-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  ore-data:

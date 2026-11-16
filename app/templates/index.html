@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% block content %}
+
+<section class="card" id="upload">
+  <h2>1. 上传输入（整版替换）</h2>
+  <p class="hint">
+    每次上传会<b>整体替换</b>该输入的全部内容，并生成新的版本号；旧报告随即标记为
+    <b>过期</b>。两类文件可以分别或同时上传。CSV 须为 UTF-8，第一列为矿石名/样本编号，
+    其后四列依次为四项元素含量。单个文件上限 {{ max_upload_mb }} MB。
+  </p>
+
+  <form method="post" action="/inputs/upload" enctype="multipart/form-data" class="upload-form">
+    <div class="upload-grid">
+      <label class="upload-box">
+        <span class="upload-title">基准 CSV（三种原矿 × 四项元素）</span>
+        <span class="upload-example">ore,Fe,SiO2,Al2O3,CaO<br>A,62.3,3.9,2.1,1.2</span>
+        <input type="file" name="baseline_file" accept=".csv,text/csv">
+      </label>
+      <label class="upload-box">
+        <span class="upload-title">成品 CSV（样本编号 × 四项元素）</span>
+        <span class="upload-example">sample_id,Fe,SiO2,Al2O3,CaO<br>S-1001,62.74,3.71,2.02,1.13</span>
+        <input type="file" name="samples_file" accept=".csv,text/csv">
+      </label>
+    </div>
+    <div class="actions">
+      <button type="submit" class="primary">上传并替换</button>
+      <span class="hint">只选择要替换的文件即可；未选择的输入保持不变。</span>
+    </div>
+  </form>
+
+  <div class="current-inputs">
+    <div class="input-card">
+      <h3>当前基准</h3>
+      {% set b = current.baseline %}
+      {% if b %}
+        <p class="meta">v{{ b.version }} · {{ b.filename or "未命名" }} · {{ b.created_at }} ·
+          <a href="/inputs/baseline/export.csv">导出</a></p>
+        <table class="mini-table">
+          <thead><tr><th>原矿</th>{% for e in b.elements %}<th>{{ e }}</th>{% endfor %}</tr></thead>
+          <tbody>
+            {% for row in b.rows %}
+            <tr><th>{{ b.names[loop.index0] }}</th>{% for v in row %}<td>{{ v }}</td>{% endfor %}</tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      {% else %}
+        <p class="empty">尚未上传基准 CSV。</p>
+      {% endif %}
+    </div>
+
+    <div class="input-card">
+      <h3>当前成品</h3>
+      {% set s = current.samples %}
+      {% if s %}
+        <p class="meta">v{{ s.version }} · {{ s.filename or "未命名" }} · {{ s.created_at }} ·
+          <a href="/inputs/samples/export.csv">导出</a></p>
+        <p class="meta">共 {{ s.count }} 个样本，元素列：{{ s.elements|join("、") }}</p>
+        <p class="meta">前几个编号：{{ s.names|join("、") }}{% if s.count > s.names|length %} …{% endif %}</p>
+      {% else %}
+        <p class="empty">尚未上传成品 CSV。</p>
+      {% endif %}
+    </div>
+  </div>
+</section>
+
+<section class="card" id="compute">
+  <h2>2. 计算占比</h2>
+  <p class="hint">
+    对每个样本，在“三项占比非负且总和为 1”的约束下最小化四项元素加权预测含量与实测值的
+    平方误差和（SSE）。若存在多组同样最优的占比，报告只会标记<b>无法唯一确定</b>并给出
+    各占比的可达区间，不会任取一组。
+  </p>
+  <form method="post" action="/compute">
+    <button type="submit" class="primary" {% if not current.baseline or not current.samples %}disabled{% endif %}>
+      基于当前输入计算并发布报告
+    </button>
+    {% if not current.baseline or not current.samples %}
+    <span class="hint">需要先上传两类输入。</span>
+    {% endif %}
+  </form>
+</section>
+
+<section class="card" id="report">
+  <h2>3. 报告</h2>
+  {% if not report %}
+    <p class="empty">尚无报告。上传输入后点击“计算”。</p>
+  {% else %}
+    <div class="report-head">
+      <div>
+        <span class="report-id">报告 #{{ report.id }}</span>
+        <span class="meta">生成于 {{ report.created_at }} · 基准 v{{ report.baseline_version }} ·
+          成品 v{{ report.samples_version }}</span>
+      </div>
+      {% if report.stale %}
+        <span class="badge badge-stale">已过期</span>
+      {% else %}
+        <span class="badge badge-fresh">与当前输入一致</span>
+      {% endif %}
+    </div>
+
+    {% if report.stale %}
+    <div class="notice notice-warn">
+      该报告对应的输入已被替换（基准{% if report.baseline_current %}一致{% else %}已更新{% endif %}，
+      成品{% if report.samples_current %}一致{% else %}已更新{% endif %}），
+      结果仅供参考。请重新计算以得到与当前输入一致的报告。
+    </div>
+    {% endif %}
+
+    {% if report.payload.warnings %}
+    <ul class="warnings">
+      {% for w in report.payload.warnings %}<li>{{ w }}</li>{% endfor %}
+    </ul>
+    {% endif %}
+
+    <div class="summary">
+      <div><span class="num">{{ report.payload.sample_count }}</span><span class="lbl">样本数</span></div>
+      <div><span class="num">{{ report.payload.non_unique_count }}</span><span class="lbl">无法唯一确定</span></div>
+      <div><span class="num">{{ report.payload.matrix_rank }}/3</span><span class="lbl">基准矩阵秩</span></div>
+      <div><a class="link" href="/reports/{{ report.id }}/export.csv">导出此报告 CSV</a></div>
+    </div>
+
+    <div class="table-scroll">
+      <table class="report-table">
+        <thead>
+          <tr>
+            <th rowspan="2">样本编号</th>
+            {% for ore in report.payload.ores %}
+            <th>{{ ore }} 占比</th>
+            {% endfor %}
+            <th rowspan="2">SSE</th>
+            <th rowspan="2">唯一性</th>
+            {% for e in report.payload.elements %}
+            <th colspan="3">{{ e }}</th>
+            {% endfor %}
+          </tr>
+          <tr>
+            {% for ore in report.payload.ores %}<th>%</th>{% endfor %}
+            {% for e in report.payload.elements %}
+              <th>实测</th><th>预测</th><th>残差</th>
+            {% endfor %}
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in report.rows %}
+          <tr class="{% if not row.unique %}row-nonunique{% endif %}">
+            <td class="sample-id">{{ row.sample_id }}</td>
+            {% if row.unique %}
+              {% for w in row.weights %}<td class="num-cell">{{ w|ratio }}</td>{% endfor %}
+            {% else %}
+              {% for r in row.weight_ranges %}
+                <td class="num-cell range">
+                  {{ r[0]|percent(2) }} ~ {{ r[1]|percent(2) }}<span class="unit">%</span>
+                </td>
+              {% endfor %}
+            {% endif %}
+            <td class="num-cell">{{ row.sse|decimal(10) }}</td>
+            <td>
+              {% if row.unique %}
+                <span class="badge badge-fresh">唯一</span>
+              {% else %}
+                <span class="badge badge-warn" title="存在多组同样最优的占比">无法唯一确定</span>
+              {% endif %}
+            </td>
+            {% for i in range(4) %}
+              <td class="num-cell">{{ row.measured[i]|decimal(8) }}</td>
+              {% if row.unique %}
+                <td class="num-cell">{{ row.predicted[i]|decimal(8) }}</td>
+                <td class="num-cell residual">{{ row.residuals[i]|signed(8) }}</td>
+              {% else %}
+                <td class="num-cell range">{{ row.predicted_ranges[i][0]|decimal(6) }} ~ {{ row.predicted_ranges[i][1]|decimal(6) }}</td>
+                <td class="num-cell range residual">{{ row.residual_ranges[i][0]|signed(6) }} ~ {{ row.residual_ranges[i][1]|signed(6) }}</td>
+              {% endif %}
+            {% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% if report.hidden_rows %}
+      <p class="hint">为保证页面可读，仅显示前 {{ report.rows|length }} 行，其余
+        {{ report.hidden_rows }} 行请通过上方 CSV 导出查看。</p>
+    {% endif %}
+    <p class="hint">
+      “无法唯一确定”表示存在多组占比达到同一最小 SSE。此时占比、预测值与残差均以可达区间
+      呈现，其中的任何具体数值都不应被当作唯一解。
+    </p>
+  {% endif %}
+</section>
+
+{% endblock %}
